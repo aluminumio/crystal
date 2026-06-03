@@ -23,23 +23,28 @@ class GCSmokeNode
   end
 end
 
-# Builds a singly-linked chain so the collector has a graph of live references
-# to walk (and, once dropped, garbage to reclaim).
-def build_chain(count : Int32) : GCSmokeNode?
+# Builds a singly-linked chain so the collector has a graph of references to
+# walk, and returns its length so callers can verify the graph is intact.
+def build_chain(count : Int32) : Int32
   head = nil
   count.times do
     node = GCSmokeNode.new(Bytes.new(64))
     node.succ = head
     head = node
   end
-  head
+
+  length = 0
+  while node = head
+    length += 1
+    head = node.succ
+  end
+  length
 end
 
-chain = build_chain(50_000)
-raise "allocation produced no chain" if chain.nil?
-
-# Drop the chain and collect; must not crash on any backend.
-chain = nil
+# Allocate a large throwaway chain (never bound to an outer variable, so it is
+# garbage as soon as `build_chain` returns) and force a collection. This must
+# not crash on any backend.
+raise "allocation produced a short chain" unless build_chain(50_000) == 50_000
 GC.collect
 
 stats = GC.stats
