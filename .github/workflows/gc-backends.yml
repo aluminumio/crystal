@@ -1,0 +1,78 @@
+# GC backend CI for the precise-GC exploration (epic #1).
+#
+# Runs alongside the existing Linux/std test suite and exercises the
+# `CrystalGC` backend abstraction directly:
+#   * the Boehm backend contract specs, and
+#   * a backend-agnostic smoke program under each GC backend the compiler can
+#     target.
+#
+# This is the harness for testing "Boehm vs. the new GC path" in parallel: when
+# the precise Immix backend lands (Phase 3, `-Dgc=immix`), it is added as one
+# more smoke step / matrix entry below — the existing Boehm path keeps running
+# unchanged so regressions in either are caught.
+#
+# Phase 1 is a standard-library-only change, so this uses the bootstrap compiler
+# against the repository's `src` (via `./bin/crystal`, which sets CRYSTAL_PATH).
+# When the compiler itself changes (Phase 2, RTTI codegen) a `make crystal` step
+# must be added so the freshly built compiler is exercised.
+name: GC Backends CI
+
+on:
+  push:
+    paths:
+      - 'src/gc/**'
+      - 'src/gc.cr'
+      - 'spec/std/gc_spec.cr'
+      - 'spec/std/gc/**'
+      - 'scripts/gc_smoke.cr'
+      - '.github/workflows/gc-backends.yml'
+  pull_request:
+    paths:
+      - 'src/gc/**'
+      - 'src/gc.cr'
+      - 'spec/std/gc_spec.cr'
+      - 'spec/std/gc/**'
+      - 'scripts/gc_smoke.cr'
+      - '.github/workflows/gc-backends.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+env:
+  TRAVIS_OS_NAME: linux
+  ARCH: x86_64
+  ARCH_CMD: linux64
+
+jobs:
+  gc-backends:
+    name: GC interface + backends
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Crystal source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Prepare System
+        run: bin/ci prepare_system
+
+      - name: Prepare Build
+        run: |
+          bin/ci prepare_build
+          bin/ci with_build_env './bin/crystal version'
+
+      - name: GC contract specs (Boehm)
+        run: bin/ci with_build_env './bin/crystal spec spec/std/gc_spec.cr spec/std/gc/'
+
+      - name: GC smoke — Boehm (default)
+        run: bin/ci with_build_env './bin/crystal run --no-color scripts/gc_smoke.cr'
+
+      - name: GC smoke — gc_none
+        run: bin/ci with_build_env './bin/crystal run --no-color -Dgc_none scripts/gc_smoke.cr'
+
+      # - name: GC smoke — Immix (epic #1, Phase 3)
+      #   run: bin/ci with_build_env './bin/crystal run --no-color -Dgc=immix scripts/gc_smoke.cr'
