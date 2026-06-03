@@ -2,6 +2,7 @@
   require "crystal/rw_lock"
 {% end %}
 require "crystal/tracing"
+require "gc/interface"
 
 # MUSL: On musl systems, libpthread is empty. The entire library is already included in libc.
 # The empty library is only available for POSIX compatibility. We don't need to link it.
@@ -182,6 +183,111 @@ lib LibGC
   fun get_thr_restart_signal = GC_get_thr_restart_signal : Int
 end
 
+module CrystalGC
+  # Boehm-Demers-Weiser conservative garbage collector backend.
+  #
+  # These are thin, policy-free wrappers over `LibGC` that implement the
+  # `CrystalGC` data-plane contract (see `gc/interface.cr`). The `GC` facade
+  # layers tracing and locking on top of them, so they are kept as a faithful
+  # mirror of the C API with no extra behavior.
+  #
+  # NOTE: thread/world integration (`pthread_*`, stop/start world, stack-bottom
+  # handling) and collection callbacks remain in the `GC` facade below: they are
+  # specific to how Boehm is embedded into the Crystal runtime rather than part
+  # of the cross-backend data-plane interface, and will be generalized when a
+  # precise backend is introduced (Phase 3).
+  module Boehm
+    def self.alloc(size : LibC::SizeT) : Void*
+      LibGC.malloc(size)
+    end
+
+    def self.alloc_atomic(size : LibC::SizeT) : Void*
+      LibGC.malloc_atomic(size)
+    end
+
+    def self.realloc(ptr : Void*, size : LibC::SizeT) : Void*
+      LibGC.realloc(ptr, size)
+    end
+
+    def self.free(ptr : Void*) : Nil
+      LibGC.free(ptr)
+    end
+
+    def self.collect : Nil
+      LibGC.collect
+    end
+
+    def self.enable : Nil
+      LibGC.enable
+    end
+
+    def self.disable : Nil
+      LibGC.disable
+    end
+
+    def self.disabled? : Bool
+      LibGC.is_disabled != 0
+    end
+
+    def self.is_heap_ptr?(pointer : Void*) : Bool
+      LibGC.is_heap_ptr(pointer) != 0
+    end
+
+    # Registers a weak (disappearing) link to a heap object.
+    def self.register_disappearing_link(pointer : Void**) : Nil
+      base = LibGC.base(pointer.value)
+      LibGC.general_register_disappearing_link(pointer, base)
+    end
+
+    def self.stats : GC::Stats
+      LibGC.get_heap_usage_safe(out heap_size, out free_bytes, out unmapped_bytes, out bytes_since_gc, out total_bytes)
+      GC::Stats.new(
+        heap_size: heap_size.to_u64!,
+        free_bytes: free_bytes.to_u64!,
+        unmapped_bytes: unmapped_bytes.to_u64!,
+        bytes_since_gc: bytes_since_gc.to_u64!,
+        total_bytes: total_bytes.to_u64!
+      )
+    end
+
+    def self.prof_stats : GC::ProfStats
+      LibGC.get_prof_stats(out stats, sizeof(LibGC::ProfStats))
+      GC::ProfStats.new(
+        heap_size: stats.heap_size.to_u64!,
+        free_bytes: stats.free_bytes.to_u64!,
+        unmapped_bytes: stats.unmapped_bytes.to_u64!,
+        bytes_since_gc: stats.bytes_since_gc.to_u64!,
+        bytes_before_gc: stats.bytes_before_gc.to_u64!,
+        non_gc_bytes: stats.non_gc_bytes.to_u64!,
+        gc_no: stats.gc_no.to_u64!,
+        markers_m1: stats.markers_m1.to_u64!,
+        bytes_reclaimed_since_gc: stats.bytes_reclaimed_since_gc.to_u64!,
+        reclaimed_bytes_before_gc: stats.reclaimed_bytes_before_gc.to_u64!,
+        expl_freed_bytes_since_gc: stats.expl_freed_bytes_since_gc.to_u64!,
+        obtained_from_os_bytes: stats.obtained_from_os_bytes.to_u64!)
+    end
+
+    # Boehm discovers thread/fiber stacks via its own machinery (Crystal pushes
+    # pending fiber stacks through `GC.push_stack`/`GC.before_collect`), so
+    # explicit stack registration is a no-op. A precise backend (Phase 3) tracks
+    # the registered regions and scans them itself.
+    def self.register_stack(stack_bottom : Void*, stack_top : Void*) : Nil
+    end
+
+    # :ditto:
+    def self.unregister_stack(stack_bottom : Void*, stack_top : Void*) : Nil
+    end
+
+    # Boehm is a conservative collector: it does not record object types and
+    # cannot enumerate live objects by type. Precise enumeration (the basis for
+    # the heap-introspection tooling) is provided by the precise backend; use
+    # `-Dgc=immix` (Phase 3+).
+    def self.enumerate_objects(&block : UInt64, Void*, LibC::SizeT ->) : Nil
+      raise NotImplementedError.new("CrystalGC::Boehm#enumerate_objects: the Boehm GC is conservative and cannot enumerate objects by type")
+    end
+  end
+end
+
 module GC
   {% if flag?(:preview_mt) %}
     @@lock = uninitialized Crystal::RWLock
@@ -190,21 +296,21 @@ module GC
   # :nodoc:
   def self.malloc(size : LibC::SizeT) : Void*
     Crystal.trace :gc, "malloc", size: size do
-      LibGC.malloc(size)
+      CrystalGC::Boehm.alloc(size)
     end
   end
 
   # :nodoc:
   def self.malloc_atomic(size : LibC::SizeT) : Void*
     Crystal.trace :gc, "malloc", size: size, atomic: 1 do
-      LibGC.malloc_atomic(size)
+      CrystalGC::Boehm.alloc_atomic(size)
     end
   end
 
   # :nodoc:
   def self.realloc(ptr : Void*, size : LibC::SizeT) : Void*
     Crystal.trace :gc, "realloc", size: size do
-      LibGC.realloc(ptr, size)
+      CrystalGC::Boehm.realloc(ptr, size)
     end
   end
 
@@ -305,25 +411,25 @@ module GC
 
   def self.collect
     Crystal.trace :gc, "collect" do
-      LibGC.collect
+      CrystalGC::Boehm.collect
     end
   end
 
   def self.enable
-    unless LibGC.is_disabled != 0
+    unless CrystalGC::Boehm.disabled?
       raise "GC is not disabled"
     end
 
-    LibGC.enable
+    CrystalGC::Boehm.enable
   end
 
   def self.disable
-    LibGC.disable
+    CrystalGC::Boehm.disable
   end
 
   def self.free(pointer : Void*) : Nil
     Crystal.trace :gc, "free" do
-      LibGC.free(pointer)
+      CrystalGC::Boehm.free(pointer)
     end
   end
 
@@ -348,46 +454,19 @@ module GC
   end
 
   def self.register_disappearing_link(pointer : Void**)
-    base = LibGC.base(pointer.value)
-    LibGC.general_register_disappearing_link(pointer, base)
+    CrystalGC::Boehm.register_disappearing_link(pointer)
   end
 
   def self.is_heap_ptr(pointer : Void*)
-    LibGC.is_heap_ptr(pointer) != 0
+    CrystalGC::Boehm.is_heap_ptr?(pointer)
   end
 
   def self.stats
-    LibGC.get_heap_usage_safe(out heap_size, out free_bytes, out unmapped_bytes, out bytes_since_gc, out total_bytes)
-    # collections = LibGC.gc_no - 1
-    # bytes_found = LibGC.bytes_found
-
-    Stats.new(
-      # collections: collections,
-      # bytes_found: bytes_found,
-      heap_size: heap_size.to_u64!,
-      free_bytes: free_bytes.to_u64!,
-      unmapped_bytes: unmapped_bytes.to_u64!,
-      bytes_since_gc: bytes_since_gc.to_u64!,
-      total_bytes: total_bytes.to_u64!
-    )
+    CrystalGC::Boehm.stats
   end
 
   def self.prof_stats
-    LibGC.get_prof_stats(out stats, sizeof(LibGC::ProfStats))
-
-    ProfStats.new(
-      heap_size: stats.heap_size.to_u64!,
-      free_bytes: stats.free_bytes.to_u64!,
-      unmapped_bytes: stats.unmapped_bytes.to_u64!,
-      bytes_since_gc: stats.bytes_since_gc.to_u64!,
-      bytes_before_gc: stats.bytes_before_gc.to_u64!,
-      non_gc_bytes: stats.non_gc_bytes.to_u64!,
-      gc_no: stats.gc_no.to_u64!,
-      markers_m1: stats.markers_m1.to_u64!,
-      bytes_reclaimed_since_gc: stats.bytes_reclaimed_since_gc.to_u64!,
-      reclaimed_bytes_before_gc: stats.reclaimed_bytes_before_gc.to_u64!,
-      expl_freed_bytes_since_gc: stats.expl_freed_bytes_since_gc.to_u64!,
-      obtained_from_os_bytes: stats.obtained_from_os_bytes.to_u64!)
+    CrystalGC::Boehm.prof_stats
   end
 
   {% if flag?(:win32) %}
