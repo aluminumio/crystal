@@ -540,6 +540,8 @@ module Crystal
         codegen_fun node.real_name, node.external, @program, is_exported_fun: true
       end
 
+      emit_rtti_table if @program.has_flag?("rtti")
+
       env_dump = ENV["DUMP"]?
       case env_dump
       when Nil
@@ -1649,6 +1651,101 @@ module Crystal
       end
 
       @main_llvm_typer.llvm_type(@program.string).const_array(id_map)
+    end
+
+    # Emits the Runtime Type Information table (epic #1, Phase 2), enabled with
+    # `-Drtti`. Produces an immutable, statically-allocated array of type
+    # descriptors indexed by `crystal_type_id`, plus two accessor functions the
+    # runtime (`src/gc/rtti.cr`) links against by name. The object header and all
+    # instance layouts are left unchanged — this is purely additive side data.
+    def emit_rtti_table
+      i32 = llvm_context.int32
+      ptr = llvm_context.void_pointer
+      ids = @program.llvm_id.@ids
+      n = ids.size
+
+      # A valid zero descriptor for any unfilled id; also fixes the struct type.
+      zero = llvm_context.const_struct([
+        i32.const_int(0), i32.const_int(0), ptr.null, ptr.null, i32.const_int(0), i32.const_int(0),
+      ])
+      td_type = zero.type
+
+      descriptors = Array(LLVM::Value).new(size: n, value: zero)
+      ids.each do |type, (_min, id)|
+        descriptors[id] = rtti_descriptor_value(type, id, i32, ptr)
+      end
+
+      table = @main_mod.globals.add(td_type.array(n), "__crystal_type_descriptors")
+      table.linkage = LLVM::Linkage::Internal
+      table.global_constant = true
+      table.initializer = td_type.const_array(descriptors)
+
+      # Define (or complete) the accessor functions. The runtime's `lib fun`
+      # declarations (`src/gc/rtti.cr`) may have already emitted body-less
+      # external declarations of these names; reuse them so appending the entry
+      # block turns the declaration into the definition instead of producing a
+      # renamed duplicate that leaves the original undefined at link time.
+      base_fn = @main_mod.functions["__crystal_type_descriptors_base"]? ||
+                @main_mod.functions.add("__crystal_type_descriptors_base", LLVM::Type.function([] of LLVM::Type, ptr))
+      base_fn.basic_blocks.append "entry" do |builder|
+        builder.ret table
+      end
+
+      count_fn = @main_mod.functions["__crystal_type_descriptors_count"]? ||
+                 @main_mod.functions.add("__crystal_type_descriptors_count", LLVM::Type.function([] of LLVM::Type, i32))
+      count_fn.basic_blocks.append "entry" do |builder|
+        builder.ret i32.const_int(n)
+      end
+    end
+
+    # Builds the constant `TypeDescriptor` struct for *type* (see `src/gc/rtti.cr`
+    # for the matching layout): `{ type_id, instance_size, name, ref_offsets,
+    # ref_count, flags }`. Reference-field offsets reuse the exact layout math
+    # `dump_type_info` uses, so they agree with the real object layout.
+    private def rtti_descriptor_value(type, id, i32, ptr)
+      instance_size = 0_u64
+      offsets = [] of UInt64
+
+      if type.is_a?(InstanceVarContainer) && !type.struct? && !type.is_a?(GenericClassType)
+        llvm_struct_type = @main_llvm_typer.llvm_struct_type(type)
+        instance_size = @main_llvm_typer.size_of(llvm_struct_type)
+
+        if type.allows_instance_vars?
+          type.all_instance_vars.each do |ivar_name, ivar|
+            next unless ivar.type.has_inner_pointers?
+            element_index = type.index_of_instance_var(ivar_name).not_nil!
+            element_index += 1 # skip the type-id header (non-struct)
+            offsets << @main_llvm_typer.offset_of(llvm_struct_type, element_index)
+          end
+        end
+      end
+
+      name = build_string_constant(type.to_s, llvm_mod: @main_mod, llvm_typer: @main_llvm_typer)
+
+      if offsets.empty?
+        ref_ptr = ptr.null
+        ref_count = 0
+      else
+        offs = @main_mod.globals.add(i32.array(offsets.size), "__crystal_rtti_offsets.#{id}")
+        offs.linkage = LLVM::Linkage::Internal
+        offs.global_constant = true
+        offs.initializer = i32.const_array(offsets.map { |o| i32.const_int(o.to_i32) })
+        ref_ptr = offs.as(LLVM::Value)
+        ref_count = offsets.size
+      end
+
+      flags = 0_u32
+      flags |= 1_u32 unless type.struct? # Reference
+      flags |= 2_u32 if offsets.empty?   # Atomic (no managed pointers)
+
+      llvm_context.const_struct([
+        i32.const_int(id),
+        i32.const_int(instance_size.to_i32!),
+        name,
+        ref_ptr,
+        i32.const_int(ref_count),
+        i32.const_int(flags.to_i32!),
+      ])
     end
 
     def visit(node : IsA)

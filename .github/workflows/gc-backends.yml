@@ -25,6 +25,8 @@ on:
       - 'spec/std/gc_spec.cr'
       - 'spec/std/gc/**'
       - 'scripts/gc_smoke.cr'
+      - 'src/compiler/crystal/codegen/codegen.cr'
+      - 'spec/compiler/codegen/rtti_spec.cr'
       - '.github/workflows/gc-backends.yml'
   pull_request:
     paths:
@@ -33,6 +35,8 @@ on:
       - 'spec/std/gc_spec.cr'
       - 'spec/std/gc/**'
       - 'scripts/gc_smoke.cr'
+      - 'src/compiler/crystal/codegen/codegen.cr'
+      - 'spec/compiler/codegen/rtti_spec.cr'
       - '.github/workflows/gc-backends.yml'
   workflow_dispatch:
 
@@ -73,6 +77,13 @@ jobs:
 
       - name: GC smoke — gc_none
         run: bin/ci with_build_env './bin/crystal run --no-color -Dgc_none scripts/gc_smoke.cr'
+
+      # RTTI side table (epic #1, Phase 2). This is a compiler-codegen change, so
+      # the spec embeds the modified `src/compiler` into the test binary and the
+      # inner `run(..., flags: ["rtti"])` programs exercise the emitted table.
+      # The without_* flags only affect linking the compiler-spec binary.
+      - name: RTTI codegen spec (-Drtti)
+        run: bin/ci with_build_env './bin/crystal spec -Dwithout_interpreter -Dwithout_libxml2 -Dwithout_openssl -Dwithout_zlib spec/compiler/codegen/rtti_spec.cr'
 
       # - name: GC smoke — Immix (epic #1, Phase 3)
       #   run: bin/ci with_build_env './bin/crystal run --no-color -Dgc=immix scripts/gc_smoke.cr'
