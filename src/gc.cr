@@ -141,3 +141,7 @@ end
 {% else %}
   require "gc/boehm"
 {% end %}
+
+# Runtime Type Information table (epic #1, Phase 2). Only emitted/consulted when
+# built with `-Drtti`; a no-op for the default backend.
+require "gc/rtti"
