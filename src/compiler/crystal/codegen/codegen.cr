@@ -1712,15 +1712,7 @@ module Crystal
       if type.is_a?(InstanceVarContainer) && !type.struct? && !type.is_a?(GenericClassType)
         llvm_struct_type = @main_llvm_typer.llvm_struct_type(type)
         instance_size = @main_llvm_typer.size_of(llvm_struct_type)
-
-        if type.allows_instance_vars?
-          type.all_instance_vars.each do |ivar_name, ivar|
-            next unless ivar.type.has_inner_pointers?
-            element_index = type.index_of_instance_var(ivar_name).not_nil!
-            element_index += 1 # skip the type-id header (non-struct)
-            offsets << @main_llvm_typer.offset_of(llvm_struct_type, element_index)
-          end
-        end
+        collect_reference_offsets(type, llvm_struct_type, 0_u64, offsets)
       end
 
       # All pointer fields are cast to the opaque void pointer so every
@@ -1754,6 +1746,36 @@ module Crystal
         i32.const_int(ref_count),
         i32.const_int(flags.to_i32!),
       ])
+    end
+
+    # Appends, to *offsets*, the byte offset of every managed-pointer field in
+    # *type*, recursing into embedded value structs so each offset points at the
+    # actual pointer slot rather than at an embedded struct's start. This makes
+    # the offset list a precise scan list. *base_offset* is the offset of *type*
+    # within the enclosing object (0 at the top level).
+    #
+    # NOTE: embedded aggregates that carry pointers but are not plain
+    # `InstanceVarContainer` structs (tuples, procs) are recorded at their field
+    # offset for now; precise flattening of those is a follow-up.
+    private def collect_reference_offsets(type, llvm_struct_type, base_offset : UInt64, offsets)
+      return unless type.is_a?(InstanceVarContainer)
+      return unless type.allows_instance_vars?
+
+      type.all_instance_vars.each do |ivar_name, ivar|
+        ivar_type = ivar.type
+        next unless ivar_type.has_inner_pointers?
+
+        element_index = type.index_of_instance_var(ivar_name).not_nil!
+        element_index += 1 unless type.struct? # skip the type-id header on non-structs
+        field_offset = base_offset + @main_llvm_typer.offset_of(llvm_struct_type, element_index)
+
+        if ivar_type.struct? && ivar_type.is_a?(InstanceVarContainer) && ivar_type.allows_instance_vars?
+          # embedded value struct: recurse so offsets point at its pointer slots
+          collect_reference_offsets(ivar_type, @main_llvm_typer.llvm_struct_type(ivar_type), field_offset, offsets)
+        else
+          offsets << field_offset
+        end
+      end
     end
 
     def visit(node : IsA)

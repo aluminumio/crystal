@@ -69,6 +69,70 @@ describe "Code gen: RTTI type descriptors" do
       CRYSTAL
   end
 
+  # The real test of "is the RTTI helpful?": can you use it to precisely walk an
+  # object's outgoing managed pointers — the exact operation a precise GC mark
+  # phase performs? These read live object memory through the descriptor.
+  it "Crystal::RTTI.each_outgoing_reference enumerates an object's live heap pointers" do
+    run(<<-CRYSTAL, flags: ["rtti"]).to_b.should be_true
+      require "prelude"
+
+      class WNode
+        property nxt : WNode?
+        property name : String
+
+        def initialize(@name, @nxt = nil)
+        end
+      end
+
+      leaf = WNode.new("leaf")
+      root = WNode.new("root", leaf)
+
+      seen = [] of UInt64
+      Crystal::RTTI.each_outgoing_reference(root) { |p| seen << p.address }
+      # root's live references are @name (a String) and @nxt (leaf); a nil @nxt
+      # would be skipped. Order-independent.
+      seen.includes?(leaf.as(Void*).address) &&
+        seen.includes?(root.name.as(Void*).address) &&
+        seen.size == 2
+      CRYSTAL
+  end
+
+  it "flattens embedded value-struct pointers to exact offsets (precise, not the struct start)" do
+    run(<<-CRYSTAL, flags: ["rtti"]).to_b.should be_true
+      require "prelude"
+
+      struct WInner
+        @pad : Int32 = 7
+        @s : String
+
+        def initialize(@s)
+        end
+      end
+
+      class WOuter
+        @flag : Int32 = 1
+        @inner : WInner
+
+        def initialize(@inner)
+        end
+      end
+
+      s = "embedded-string"
+      o = WOuter.new(WInner.new(s))
+
+      seen = [] of UInt64
+      Crystal::RTTI.each_outgoing_reference(o) { |p| seen << p.address }
+      # The String lives inside the embedded WInner value struct; precise RTTI
+      # must point at it directly, so the walker finds it.
+      seen.includes?(s.as(Void*).address)
+      CRYSTAL
+  end
+
+  # GOAL (TDD red → next increment): variable-length container support. Precise
+  # marking of an Array must scan its separately-allocated buffer's elements,
+  # which needs the descriptor to carry the buffer offset + element layout.
+  pending "scans Array buffer elements for references (container descriptors)"
+
   it "gives distinct generic instantiations their own descriptors" do
     run(<<-CRYSTAL, flags: ["rtti"]).to_b.should be_true
       require "prelude"

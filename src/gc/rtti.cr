@@ -97,4 +97,20 @@ module Crystal::RTTI
   def self.descriptor(obj : Reference) : TypeDescriptor
     descriptor(obj.crystal_type_id)
   end
+
+  # Yields each non-null managed heap pointer stored directly in *obj*, located
+  # precisely from the type's reference-field offsets — the operation a precise
+  # GC mark phase performs on an object. Offsets are flattened through embedded
+  # value structs, so each points at an actual pointer slot.
+  #
+  # NOTE: pointers held inside variable-length container buffers (e.g. `Array`'s
+  # backing buffer) are not yet enumerated; see the pending container spec.
+  def self.each_outgoing_reference(obj : Reference, & : Void* ->) : Nil
+    desc = descriptor(obj)
+    base = obj.as(Void*).address
+    desc.reference_offsets.each do |offset|
+      ptr = Pointer(Void*).new(base + offset).value
+      yield ptr unless ptr.null?
+    end
+  end
 end
