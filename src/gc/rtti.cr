@@ -33,11 +33,51 @@ module Crystal::RTTI
     @ref_offsets : UInt32*
     @ref_count : UInt32
     @flags : TypeFlags
+    # Variable-length container fields (e.g. `Array`); `@buffer_offset` is -1 for
+    # non-containers. They describe a separately-allocated element buffer.
+    # `@element_kind`: 0 = elements hold no managed pointers, 1 = each element is
+    # itself a managed pointer (a reference-like element, e.g. `Array(String)`).
+    @buffer_offset : Int32
+    @size_offset : Int32
+    @element_kind : Int32
+    @element_stride : Int32
 
     # Descriptors are materialized by reinterpreting the compiler-emitted table
     # (`Pointer#value`), not constructed; this initializer only satisfies the
     # nil-analysis and is unused at runtime.
-    def initialize(@type_id, @instance_size, @name, @ref_offsets, @ref_count, @flags)
+    def initialize(@type_id, @instance_size, @name, @ref_offsets, @ref_count, @flags,
+                   @buffer_offset, @size_offset, @element_kind, @element_stride)
+    end
+
+    # Whether instances are heap-allocated references (carry the type-id header).
+    def reference? : Bool
+      @flags.reference?
+    end
+
+    # Whether this type has a variable-length element buffer (e.g. `Array`).
+    def container? : Bool
+      @buffer_offset >= 0
+    end
+
+    # Byte offset of the buffer pointer field (valid when `container?`).
+    def buffer_offset : Int32
+      @buffer_offset
+    end
+
+    # Byte offset of the `Int32` live-element-count field (valid when `container?`).
+    def size_offset : Int32
+      @size_offset
+    end
+
+    # Element kind: 0 = no managed pointers, 1 = each element is a managed
+    # pointer (valid when `container?`).
+    def element_kind : Int32
+      @element_kind
+    end
+
+    # Byte stride between elements in the buffer (valid when `container?`).
+    def element_stride : Int32
+      @element_stride
     end
 
     # The `crystal_type_id` this descriptor describes.
@@ -108,9 +148,29 @@ module Crystal::RTTI
   def self.each_outgoing_reference(obj : Reference, & : Void* ->) : Nil
     desc = descriptor(obj)
     base = obj.as(Void*).address
+
     desc.reference_offsets.each do |offset|
       ptr = Pointer(Void*).new(base + offset).value
       yield ptr unless ptr.null?
+    end
+
+    # Variable-length container (e.g. Array): scan the live elements of the
+    # separately-allocated buffer. Currently handles reference-like elements
+    # (each element is a managed pointer); aggregate value-struct elements with
+    # inner pointers are a documented follow-up (element_kind 0 here, so the
+    # buffer is still retained conservatively via its pointer in reference_offsets).
+    if desc.container? && desc.element_kind == 1
+      buffer = Pointer(Void*).new(base + desc.buffer_offset.to_u64).value
+      return if buffer.null?
+      count = Pointer(Int32).new(base + desc.size_offset.to_u64).value
+      return if count <= 0
+
+      stride = desc.element_stride.to_u64
+      buffer_addr = buffer.address
+      count.times do |i|
+        ptr = Pointer(Void*).new(buffer_addr + i.to_u64 * stride).value
+        yield ptr unless ptr.null?
+      end
     end
   end
 end

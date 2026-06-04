@@ -1665,8 +1665,10 @@ module Crystal
       n = ids.size
 
       # A valid zero descriptor for any unfilled id; also fixes the struct type.
+      # Trailing -1s mark "not a variable-length container".
       zero = llvm_context.const_struct([
         i32.const_int(0), i32.const_int(0), ptr.null, ptr.null, i32.const_int(0), i32.const_int(0),
+        i32.const_int(-1), i32.const_int(-1), i32.const_int(-1), i32.const_int(0),
       ])
       td_type = zero.type
 
@@ -1738,6 +1740,27 @@ module Crystal
       flags |= 1_u32 unless type.struct? # Reference
       flags |= 2_u32 if offsets.empty?   # Atomic (no managed pointers)
 
+      # Variable-length container layout. Only `Array(T)` is special-cased for
+      # now (the most common container; matches the Scala Native precedent):
+      # precise marking must scan its separately-allocated `@buffer[0...@size]`.
+      buffer_offset = -1
+      size_offset = -1
+      element_kind = 0
+      element_stride = 0
+      if type.is_a?(GenericClassInstanceType) && type.generic_type == @program.array
+        element_type = type.type_vars["T"].type
+        if element_type.is_a?(Type)
+          ls = @main_llvm_typer.llvm_struct_type(type)
+          buffer_offset = rtti_ivar_offset(type, ls, "@buffer")
+          size_offset = rtti_ivar_offset(type, ls, "@size")
+          # 1 = each element is itself a managed pointer (reference-like, incl.
+          # virtual / nilable references). Aggregate value-struct elements are a
+          # follow-up; using type_id here would crash on virtual element types.
+          element_kind = element_type.reference_like? ? 1 : 0
+          element_stride = @main_llvm_typer.size_of(@main_llvm_typer.llvm_embedded_type(element_type)).to_i32!
+        end
+      end
+
       llvm_context.const_struct([
         i32.const_int(id),
         i32.const_int(instance_size.to_i32!),
@@ -1745,7 +1768,18 @@ module Crystal
         ref_ptr,
         i32.const_int(ref_count),
         i32.const_int(flags.to_i32!),
+        i32.const_int(buffer_offset),
+        i32.const_int(size_offset),
+        i32.const_int(element_kind),
+        i32.const_int(element_stride),
       ])
+    end
+
+    # Byte offset of *ivar_name* within *type*'s instance layout.
+    private def rtti_ivar_offset(type, llvm_struct_type, ivar_name) : Int32
+      element_index = type.index_of_instance_var(ivar_name).not_nil!
+      element_index += 1 unless type.struct? # skip the type-id header on non-structs
+      @main_llvm_typer.offset_of(llvm_struct_type, element_index).to_i32!
     end
 
     # Appends, to *offsets*, the byte offset of every managed-pointer field in

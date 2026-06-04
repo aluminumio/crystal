@@ -128,10 +128,29 @@ describe "Code gen: RTTI type descriptors" do
       CRYSTAL
   end
 
-  # GOAL (TDD red → next increment): variable-length container support. Precise
-  # marking of an Array must scan its separately-allocated buffer's elements,
-  # which needs the descriptor to carry the buffer offset + element layout.
-  pending "scans Array buffer elements for references (container descriptors)"
+  it "scans Array buffer elements for references (variable-length container)" do
+    run(<<-CRYSTAL, flags: ["rtti"]).to_b.should be_true
+      require "prelude"
+
+      a = ["alpha", "beta", "gamma"]
+      seen = [] of UInt64
+      Crystal::RTTI.each_outgoing_reference(a) { |p| seen << p.address }
+      # Precise marking of the Array must reach every element String stored in
+      # its separately-allocated buffer.
+      a.all? { |s| seen.includes?(s.as(Void*).address) }
+      CRYSTAL
+  end
+
+  it "reports an Array's element layout (buffer/size offsets, element type)" do
+    run(<<-CRYSTAL, flags: ["rtti"]).to_b.should be_true
+      require "prelude"
+
+      d = Crystal::RTTI.descriptor([1, 2, 3])
+      d.container? &&
+        d.buffer_offset == offsetof(Array(Int32), @buffer) &&
+        d.size_offset == offsetof(Array(Int32), @size)
+      CRYSTAL
+  end
 
   it "gives distinct generic instantiations their own descriptors" do
     run(<<-CRYSTAL, flags: ["rtti"]).to_b.should be_true
