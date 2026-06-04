@@ -152,6 +152,29 @@ describe "Code gen: RTTI type descriptors" do
       CRYSTAL
   end
 
+  # The payoff: a per-type live-heap usage report ("what's in my heap?"),
+  # combining Boehm heap enumeration with the RTTI type map.
+  it "Crystal::RTTI.heap_report tallies live objects by type" do
+    run(<<-CRYSTAL, flags: ["rtti"]).to_b.should be_true
+      require "prelude"
+
+      class HeapReportWidget
+        @a : Int64 = 1
+        @b : Int64 = 2
+      end
+
+      kept = Array(HeapReportWidget).new(1000) { HeapReportWidget.new }
+
+      report = Crystal::RTTI.heap_report
+      widget = report.find { |u| u.name == "HeapReportWidget" }
+
+      kept.size == 1000 &&
+        !widget.nil? &&
+        widget.not_nil!.count >= 1000 &&
+        widget.not_nil!.bytes >= 1000_i64 * instance_sizeof(HeapReportWidget)
+      CRYSTAL
+  end
+
   it "gives distinct generic instantiations their own descriptors" do
     run(<<-CRYSTAL, flags: ["rtti"]).to_b.should be_true
       require "prelude"

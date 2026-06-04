@@ -1757,7 +1757,11 @@ module Crystal
           # virtual / nilable references). Aggregate value-struct elements are a
           # follow-up; using type_id here would crash on virtual element types.
           element_kind = element_type.reference_like? ? 1 : 0
-          element_stride = @main_llvm_typer.size_of(@main_llvm_typer.llvm_embedded_type(element_type)).to_i32!
+          # Reference-like elements are stored in the buffer as pointers, so the
+          # stride is just the pointer size. (Avoid sizing the embedded element
+          # type, which can trip LLVM layout queries — e.g. scalable vectors — on
+          # some targets, and is irrelevant when element_kind is 0.)
+          element_stride = element_kind == 1 ? (@program.has_flag?("bits64") ? 8 : 4) : 0
         end
       end
 

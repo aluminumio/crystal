@@ -173,4 +173,56 @@ module Crystal::RTTI
       end
     end
   end
+
+  # A per-type live-heap usage entry.
+  record TypeUsage,
+    type_id : Int32,
+    name : String,
+    count : Int64,
+    bytes : Int64
+
+  # Produces a per-type histogram of live heap objects — the "what's in my heap?"
+  # report — sorted by total bytes descending. Runs a collection first for an
+  # accurate picture, then enumerates reachable objects, mapping each object's
+  # type-id header to its descriptor.
+  #
+  # Allocations whose header is not a valid type id (raw buffers, e.g. an Array's
+  # or String's backing storage) are tallied together under `(untyped)`.
+  def self.heap_report : Array(TypeUsage)
+    GC.collect
+    n = LibRTTI.count
+
+    # Pre-allocated, indexed by type id (plus a 2-slot tally for untyped
+    # allocations), filled in place during enumeration so the lock-held callback
+    # never allocates GC memory.
+    object_counts = Array(Int64).new(n, 0_i64)
+    byte_counts = Array(Int64).new(n, 0_i64)
+    untyped = Array(Int64).new(2, 0_i64) # [count, bytes]
+
+    CrystalGC::Boehm.enumerate_objects do |type_id, _address, size|
+      # Unchecked conversions: a raw buffer's first bytes can be any value
+      # (e.g. a negative Int32 header read becomes a huge UInt64), which must
+      # simply fall outside the valid id range into the untyped bucket rather
+      # than overflow.
+      tid = type_id.to_i64!
+      if 0_i64 <= tid && tid < n
+        i = tid.to_i32!
+        object_counts[i] += 1
+        byte_counts[i] += size.to_i64!
+      else
+        untyped[0] += 1
+        untyped[1] += size.to_i64!
+      end
+    end
+
+    report = [] of TypeUsage
+    n.times do |tid|
+      next if object_counts[tid] == 0
+      report << TypeUsage.new(tid, descriptor(tid).name, object_counts[tid], byte_counts[tid])
+    end
+    if untyped[0] > 0
+      report << TypeUsage.new(-1, "(untyped)", untyped[0], untyped[1])
+    end
+    report.sort_by! { |usage| -usage.bytes }
+  end
 end

@@ -58,10 +58,21 @@ require "../spec_helper"
       CrystalGC::Boehm.unregister_stack(bottom, top)
     end
 
-    it "enumerate_objects raises NotImplementedError (Boehm is conservative)" do
-      expect_raises(NotImplementedError) do
-        CrystalGC::Boehm.enumerate_objects { |_type_id, _address, _size| }
+    it "enumerate_objects yields reachable objects after a collection" do
+      kept = Array(String).new(64) { |i| "kept-#{i}" }
+      GC.collect
+
+      count = 0
+      total = 0_u64
+      CrystalGC::Boehm.enumerate_objects do |_type_id, address, size|
+        count += 1
+        total += size
+        address.null?.should be_false
       end
+
+      count.should be > 0
+      total.should be > 0
+      kept.size.should eq(64) # keep `kept` reachable past enumeration
     end
   end
 {% end %}
