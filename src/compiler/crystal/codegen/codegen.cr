@@ -1685,10 +1685,13 @@ module Crystal
       # external declarations of these names; reuse them so appending the entry
       # block turns the declaration into the definition instead of producing a
       # renamed duplicate that leaves the original undefined at link time.
+      # `table` is a `[N x descriptor]*`; the accessor returns an opaque void
+      # pointer, so cast (a no-op on LLVM 15+, a constant bitcast on pre-15).
+      table_base = cast_to_void_pointer(table)
       base_fn = @main_mod.functions["__crystal_type_descriptors_base"]? ||
                 @main_mod.functions.add("__crystal_type_descriptors_base", LLVM::Type.function([] of LLVM::Type, ptr))
       base_fn.basic_blocks.append "entry" do |builder|
-        builder.ret table
+        builder.ret table_base
       end
 
       count_fn = @main_mod.functions["__crystal_type_descriptors_count"]? ||
@@ -1720,7 +1723,12 @@ module Crystal
         end
       end
 
-      name = build_string_constant(type.to_s, llvm_mod: @main_mod, llvm_typer: @main_llvm_typer)
+      # All pointer fields are cast to the opaque void pointer so every
+      # descriptor has the *same* struct type (required by `const_array`). This
+      # matters on pre-15 LLVM where pointers are typed: the per-type offset
+      # arrays are `[k x i32]*` with a different `k` each, and `name` is a
+      # `String*`. On LLVM 15+ this is a no-op (all pointers are `ptr`).
+      name = cast_to_void_pointer(build_string_constant(type.to_s, llvm_mod: @main_mod, llvm_typer: @main_llvm_typer))
 
       if offsets.empty?
         ref_ptr = ptr.null
@@ -1730,7 +1738,7 @@ module Crystal
         offs.linkage = LLVM::Linkage::Internal
         offs.global_constant = true
         offs.initializer = i32.const_array(offsets.map { |o| i32.const_int(o.to_i32) })
-        ref_ptr = offs.as(LLVM::Value)
+        ref_ptr = cast_to_void_pointer(offs)
         ref_count = offsets.size
       end
 
