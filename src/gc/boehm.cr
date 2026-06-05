@@ -297,7 +297,10 @@ module CrystalGC
     # GC memory. Call `GC.collect` first for an up-to-date picture.
     def self.enumerate_objects(&block : UInt64, Void*, LibC::SizeT ->) : Nil
       boxed = Box.box(block)
-      LibGC.call_with_alloc_lock(->(data : Void*) : Void* {
+      # NOTE: no explicit return-type annotation on these proc literals — the
+      # return type is inferred (the outer returns `Void*`), and the annotated
+      # form (`-> : Void*`) doesn't parse on the minimum bootstrap (Crystal 1.0.0).
+      LibGC.call_with_alloc_lock(->(data : Void*) {
         LibGC.enumerate_reachable_objects_inner(->(obj : Void*, bytes : LibGC::SizeT, cd : Void*) {
           callback = Box(typeof(block)).unbox(cd)
           type_id = obj.as(Int32*).value
