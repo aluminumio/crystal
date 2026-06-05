@@ -1803,12 +1803,21 @@ module Crystal
         ivar_type = ivar.type
         next unless ivar_type.has_inner_pointers?
 
+        # C-interop and opaque aggregates are not precisely scanned: extern C
+        # structs/unions hold C-managed state (conservative-scan territory per
+        # the interop design), and querying their member offsets is invalid —
+        # on some LLVM/target builds (musl LLVM 20.1.8) `offset_of` on an extern
+        # union member even aborts ("Invalid size request on a scalable vector"),
+        # while others silently return a wrong value. Mirrors the guard in
+        # `dump_type_info#ivar_offset_and_size`.
+        next if ivar_type.extern? || ivar_type.extern_union? || ivar_type.is_a?(StaticArrayInstanceType)
+
         element_index = type.index_of_instance_var(ivar_name).not_nil!
         element_index += 1 unless type.struct? # skip the type-id header on non-structs
         field_offset = base_offset + @main_llvm_typer.offset_of(llvm_struct_type, element_index)
 
         if ivar_type.struct? && ivar_type.is_a?(InstanceVarContainer) && ivar_type.allows_instance_vars?
-          # embedded value struct: recurse so offsets point at its pointer slots
+          # embedded Crystal value struct: recurse so offsets point at its pointer slots
           collect_reference_offsets(ivar_type, @main_llvm_typer.llvm_struct_type(ivar_type), field_offset, offsets)
         else
           offsets << field_offset

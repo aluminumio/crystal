@@ -175,6 +175,34 @@ describe "Code gen: RTTI type descriptors" do
       CRYSTAL
   end
 
+  it "heap_report exactly accounts for a controlled, uniquely-typed allocation" do
+    run(<<-CRYSTAL, flags: ["rtti"]).to_b.should be_true
+      require "prelude"
+
+      # A type referenced nowhere else, so the report's tally for it must be
+      # *exactly* what this program allocates — no more (nothing else makes one)
+      # and no fewer (all are held live).
+      class HeapReportExact
+        @x : Int64 = 0
+        @y : Int64 = 0
+      end
+
+      n = 777
+      kept = Array(HeapReportExact).new(n) { HeapReportExact.new }
+      GC.collect
+
+      entry = Crystal::RTTI.heap_report.find { |u| u.name == "HeapReportExact" }.not_nil!
+
+      # report == memory objects: the count is exact (every allocated object
+      # accounted for, none extra). The reported bytes are the *real* allocated
+      # size, which Boehm rounds up to a size class, so it is at least — and
+      # typically more than — the logical instance size.
+      exact_count = entry.count == n
+      real_bytes = entry.bytes >= n.to_i64 * instance_sizeof(HeapReportExact)
+      kept.size == n && exact_count && real_bytes
+      CRYSTAL
+  end
+
   it "gives distinct generic instantiations their own descriptors" do
     run(<<-CRYSTAL, flags: ["rtti"]).to_b.should be_true
       require "prelude"
