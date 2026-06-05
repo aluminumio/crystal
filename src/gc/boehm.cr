@@ -181,6 +181,15 @@ lib LibGC
   fun start_world_external = GC_start_world_external
   fun get_suspend_signal = GC_get_suspend_signal : Int
   fun get_thr_restart_signal = GC_get_thr_restart_signal : Int
+
+  # Heap enumeration. `enumerate_reachable_objects_inner` reports every object
+  # the last collection marked as reachable; it must run while holding the
+  # allocation lock (`call_with_alloc_lock`).
+  alias ReachableObjectProc = (Void*, SizeT, Void* ->)
+  fun enumerate_reachable_objects_inner = GC_enumerate_reachable_objects_inner(proc : ReachableObjectProc, client_data : Void*)
+
+  alias AllocLockFn = (Void* -> Void*)
+  fun call_with_alloc_lock = GC_call_with_alloc_lock(fn : AllocLockFn, client_data : Void*) : Void*
 end
 
 module CrystalGC
@@ -278,12 +287,27 @@ module CrystalGC
     def self.unregister_stack(stack_bottom : Void*, stack_top : Void*) : Nil
     end
 
-    # Boehm is a conservative collector: it does not record object types and
-    # cannot enumerate live objects by type. Precise enumeration (the basis for
-    # the heap-introspection tooling) is provided by the precise backend; use
-    # `-Dgc=immix` (Phase 3+).
+    # Enumerates every object the collector currently considers reachable,
+    # yielding `{type_id, address, size}`. `type_id` is read from the object's
+    # header (offset 0); for non-Crystal allocations (raw buffers) it is whatever
+    # those first bytes happen to be, so callers that want type names must
+    # validate it against the RTTI table (see `Crystal::RTTI.heap_report`).
+    #
+    # Enumeration runs under the allocation lock, so the block MUST NOT allocate
+    # GC memory. Call `GC.collect` first for an up-to-date picture.
     def self.enumerate_objects(&block : UInt64, Void*, LibC::SizeT ->) : Nil
-      raise NotImplementedError.new("CrystalGC::Boehm#enumerate_objects: the Boehm GC is conservative and cannot enumerate objects by type")
+      boxed = Box.box(block)
+      # NOTE: no explicit return-type annotation on these proc literals — the
+      # return type is inferred (the outer returns `Void*`), and the annotated
+      # form (`-> : Void*`) doesn't parse on the minimum bootstrap (Crystal 1.0.0).
+      LibGC.call_with_alloc_lock(->(data : Void*) {
+        LibGC.enumerate_reachable_objects_inner(->(obj : Void*, bytes : LibGC::SizeT, cd : Void*) {
+          callback = Box(typeof(block)).unbox(cd)
+          type_id = obj.as(Int32*).value
+          callback.call(type_id.to_u64!, obj, bytes)
+        }, data)
+        Pointer(Void).null
+      }, boxed)
     end
   end
 end

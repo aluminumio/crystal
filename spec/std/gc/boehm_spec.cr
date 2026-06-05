@@ -58,10 +58,30 @@ require "../spec_helper"
       CrystalGC::Boehm.unregister_stack(bottom, top)
     end
 
-    it "enumerate_objects raises NotImplementedError (Boehm is conservative)" do
-      expect_raises(NotImplementedError) do
-        CrystalGC::Boehm.enumerate_objects { |_type_id, _address, _size| }
+    # Heap enumeration invokes a C callback under the GC allocation lock. Under
+    # the interpreter, a C-to-interpreted callback while the lock is held hangs,
+    # so this compiled-mode capability is not exercised there.
+    {% unless flag?(:interpreted) %}
+      it "enumerate_objects yields reachable objects after a collection" do
+        kept = Array(String).new(64) { |i| "kept-#{i}" }
+        GC.collect
+
+        # The callback runs under the GC allocation lock, so it MUST NOT allocate:
+        # accumulate into pre-existing locals here and assert after enumeration.
+        count = 0
+        total = 0_u64
+        saw_null = false
+        CrystalGC::Boehm.enumerate_objects do |_type_id, address, size|
+          count += 1
+          total += size
+          saw_null = true if address.null?
+        end
+
+        count.should be > 0
+        total.should be > 0
+        saw_null.should be_false
+        kept.size.should eq(64) # keep `kept` reachable past enumeration
       end
-    end
+    {% end %}
   end
 {% end %}

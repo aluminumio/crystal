@@ -69,6 +69,140 @@ describe "Code gen: RTTI type descriptors" do
       CRYSTAL
   end
 
+  # The real test of "is the RTTI helpful?": can you use it to precisely walk an
+  # object's outgoing managed pointers — the exact operation a precise GC mark
+  # phase performs? These read live object memory through the descriptor.
+  it "Crystal::RTTI.each_outgoing_reference enumerates an object's live heap pointers" do
+    run(<<-CRYSTAL, flags: ["rtti"]).to_b.should be_true
+      require "prelude"
+
+      class WNode
+        property nxt : WNode?
+        property name : String
+
+        def initialize(@name, @nxt = nil)
+        end
+      end
+
+      leaf = WNode.new("leaf")
+      root = WNode.new("root", leaf)
+
+      seen = [] of UInt64
+      Crystal::RTTI.each_outgoing_reference(root) { |p| seen << p.address }
+      # root's live references are @name (a String) and @nxt (leaf); a nil @nxt
+      # would be skipped. Order-independent.
+      seen.includes?(leaf.as(Void*).address) &&
+        seen.includes?(root.name.as(Void*).address) &&
+        seen.size == 2
+      CRYSTAL
+  end
+
+  it "flattens embedded value-struct pointers to exact offsets (precise, not the struct start)" do
+    run(<<-CRYSTAL, flags: ["rtti"]).to_b.should be_true
+      require "prelude"
+
+      struct WInner
+        @pad : Int32 = 7
+        @s : String
+
+        def initialize(@s)
+        end
+      end
+
+      class WOuter
+        @flag : Int32 = 1
+        @inner : WInner
+
+        def initialize(@inner)
+        end
+      end
+
+      s = "embedded-string"
+      o = WOuter.new(WInner.new(s))
+
+      seen = [] of UInt64
+      Crystal::RTTI.each_outgoing_reference(o) { |p| seen << p.address }
+      # The String lives inside the embedded WInner value struct; precise RTTI
+      # must point at it directly, so the walker finds it.
+      seen.includes?(s.as(Void*).address)
+      CRYSTAL
+  end
+
+  it "scans Array buffer elements for references (variable-length container)" do
+    run(<<-CRYSTAL, flags: ["rtti"]).to_b.should be_true
+      require "prelude"
+
+      a = ["alpha", "beta", "gamma"]
+      seen = [] of UInt64
+      Crystal::RTTI.each_outgoing_reference(a) { |p| seen << p.address }
+      # Precise marking of the Array must reach every element String stored in
+      # its separately-allocated buffer.
+      a.all? { |s| seen.includes?(s.as(Void*).address) }
+      CRYSTAL
+  end
+
+  it "reports an Array's element layout (buffer/size offsets, element type)" do
+    run(<<-CRYSTAL, flags: ["rtti"]).to_b.should be_true
+      require "prelude"
+
+      d = Crystal::RTTI.descriptor([1, 2, 3])
+      d.container? &&
+        d.buffer_offset == offsetof(Array(Int32), @buffer) &&
+        d.size_offset == offsetof(Array(Int32), @size)
+      CRYSTAL
+  end
+
+  # The payoff: a per-type live-heap usage report ("what's in my heap?"),
+  # combining Boehm heap enumeration with the RTTI type map.
+  it "Crystal::RTTI.heap_report tallies live objects by type" do
+    run(<<-CRYSTAL, flags: ["rtti"]).to_b.should be_true
+      require "prelude"
+
+      class HeapReportWidget
+        @a : Int64 = 1
+        @b : Int64 = 2
+      end
+
+      kept = Array(HeapReportWidget).new(1000) { HeapReportWidget.new }
+
+      report = Crystal::RTTI.heap_report
+      widget = report.find { |u| u.name == "HeapReportWidget" }
+
+      kept.size == 1000 &&
+        !widget.nil? &&
+        widget.not_nil!.count >= 1000 &&
+        widget.not_nil!.bytes >= 1000_i64 * instance_sizeof(HeapReportWidget)
+      CRYSTAL
+  end
+
+  it "heap_report exactly accounts for a controlled, uniquely-typed allocation" do
+    run(<<-CRYSTAL, flags: ["rtti"]).to_b.should be_true
+      require "prelude"
+
+      # A type referenced nowhere else, so the report's tally for it must be
+      # *exactly* what this program allocates — no more (nothing else makes one)
+      # and no fewer (all are held live).
+      class HeapReportExact
+        @x : Int64 = 0
+        @y : Int64 = 0
+      end
+
+      n = 777
+      kept = Array(HeapReportExact).new(n) { HeapReportExact.new }
+      GC.collect
+
+      entry = Crystal::RTTI.heap_report.find { |u| u.name == "HeapReportExact" }.not_nil!
+
+      # report == memory objects: the count is exact (every allocated object
+      # accounted for, none extra). The reported bytes are the *real* allocated
+      # size, which Boehm rounds up to a size class, so it is at least — and
+      # typically more than — the logical instance size.
+      exact_count = entry.count == n
+      real_bytes = entry.bytes >= n.to_i64 * instance_sizeof(HeapReportExact)
+      kept.size == n && exact_count && real_bytes
+      CRYSTAL
+  end
+
   it "gives distinct generic instantiations their own descriptors" do
     run(<<-CRYSTAL, flags: ["rtti"]).to_b.should be_true
       require "prelude"

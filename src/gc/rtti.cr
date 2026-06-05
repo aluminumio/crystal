@@ -33,11 +33,51 @@ module Crystal::RTTI
     @ref_offsets : UInt32*
     @ref_count : UInt32
     @flags : TypeFlags
+    # Variable-length container fields (e.g. `Array`); `@buffer_offset` is -1 for
+    # non-containers. They describe a separately-allocated element buffer.
+    # `@element_kind`: 0 = elements hold no managed pointers, 1 = each element is
+    # itself a managed pointer (a reference-like element, e.g. `Array(String)`).
+    @buffer_offset : Int32
+    @size_offset : Int32
+    @element_kind : Int32
+    @element_stride : Int32
 
     # Descriptors are materialized by reinterpreting the compiler-emitted table
     # (`Pointer#value`), not constructed; this initializer only satisfies the
     # nil-analysis and is unused at runtime.
-    def initialize(@type_id, @instance_size, @name, @ref_offsets, @ref_count, @flags)
+    def initialize(@type_id, @instance_size, @name, @ref_offsets, @ref_count, @flags,
+                   @buffer_offset, @size_offset, @element_kind, @element_stride)
+    end
+
+    # Whether instances are heap-allocated references (carry the type-id header).
+    def reference? : Bool
+      @flags.reference?
+    end
+
+    # Whether this type has a variable-length element buffer (e.g. `Array`).
+    def container? : Bool
+      @buffer_offset >= 0
+    end
+
+    # Byte offset of the buffer pointer field (valid when `container?`).
+    def buffer_offset : Int32
+      @buffer_offset
+    end
+
+    # Byte offset of the `Int32` live-element-count field (valid when `container?`).
+    def size_offset : Int32
+      @size_offset
+    end
+
+    # Element kind: 0 = no managed pointers, 1 = each element is a managed
+    # pointer (valid when `container?`).
+    def element_kind : Int32
+      @element_kind
+    end
+
+    # Byte stride between elements in the buffer (valid when `container?`).
+    def element_stride : Int32
+      @element_stride
     end
 
     # The `crystal_type_id` this descriptor describes.
@@ -96,5 +136,93 @@ module Crystal::RTTI
   # The descriptor for a live heap object, via its type-id header.
   def self.descriptor(obj : Reference) : TypeDescriptor
     descriptor(obj.crystal_type_id)
+  end
+
+  # Yields each non-null managed heap pointer stored directly in *obj*, located
+  # precisely from the type's reference-field offsets — the operation a precise
+  # GC mark phase performs on an object. Offsets are flattened through embedded
+  # value structs, so each points at an actual pointer slot.
+  #
+  # NOTE: pointers held inside variable-length container buffers (e.g. `Array`'s
+  # backing buffer) are not yet enumerated; see the pending container spec.
+  def self.each_outgoing_reference(obj : Reference, &block : Void* ->) : Nil
+    desc = descriptor(obj)
+    base = obj.as(Void*).address
+
+    desc.reference_offsets.each do |offset|
+      ptr = Pointer(Void*).new(base + offset).value
+      block.call(ptr) unless ptr.null?
+    end
+
+    # Variable-length container (e.g. Array): scan the live elements of the
+    # separately-allocated buffer. Currently handles reference-like elements
+    # (each element is a managed pointer); aggregate value-struct elements with
+    # inner pointers are a documented follow-up (element_kind 0 here, so the
+    # buffer is still retained conservatively via its pointer in reference_offsets).
+    if desc.container? && desc.element_kind == 1
+      buffer = Pointer(Void*).new(base + desc.buffer_offset.to_u64).value
+      return if buffer.null?
+      count = Pointer(Int32).new(base + desc.size_offset.to_u64).value
+      return if count <= 0
+
+      stride = desc.element_stride.to_u64
+      buffer_addr = buffer.address
+      count.times do |i|
+        ptr = Pointer(Void*).new(buffer_addr + i.to_u64 * stride).value
+        block.call(ptr) unless ptr.null?
+      end
+    end
+  end
+
+  # A per-type live-heap usage entry.
+  record TypeUsage,
+    type_id : Int32,
+    name : String,
+    count : Int64,
+    bytes : Int64
+
+  # Produces a per-type histogram of live heap objects — the "what's in my heap?"
+  # report — sorted by total bytes descending. Runs a collection first for an
+  # accurate picture, then enumerates reachable objects, mapping each object's
+  # type-id header to its descriptor.
+  #
+  # Allocations whose header is not a valid type id (raw buffers, e.g. an Array's
+  # or String's backing storage) are tallied together under `(untyped)`.
+  def self.heap_report : Array(TypeUsage)
+    GC.collect
+    n = LibRTTI.count
+
+    # Pre-allocated, indexed by type id (plus a 2-slot tally for untyped
+    # allocations), filled in place during enumeration so the lock-held callback
+    # never allocates GC memory.
+    object_counts = Array(Int64).new(n, 0_i64)
+    byte_counts = Array(Int64).new(n, 0_i64)
+    untyped = Array(Int64).new(2, 0_i64) # [count, bytes]
+
+    CrystalGC::Boehm.enumerate_objects do |type_id, _address, size|
+      # Unchecked conversions: a raw buffer's first bytes can be any value
+      # (e.g. a negative Int32 header read becomes a huge UInt64), which must
+      # simply fall outside the valid id range into the untyped bucket rather
+      # than overflow.
+      tid = type_id.to_i64!
+      if 0_i64 <= tid && tid < n
+        i = tid.to_i32!
+        object_counts[i] += 1
+        byte_counts[i] += size.to_i64!
+      else
+        untyped[0] += 1
+        untyped[1] += size.to_i64!
+      end
+    end
+
+    report = [] of TypeUsage
+    n.times do |tid|
+      next if object_counts[tid] == 0
+      report << TypeUsage.new(tid, descriptor(tid).name, object_counts[tid], byte_counts[tid])
+    end
+    if untyped[0] > 0
+      report << TypeUsage.new(-1, "(untyped)", untyped[0], untyped[1])
+    end
+    report.sort_by! { |usage| -usage.bytes }
   end
 end
