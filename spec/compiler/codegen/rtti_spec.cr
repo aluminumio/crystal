@@ -203,6 +203,67 @@ describe "Code gen: RTTI type descriptors" do
       CRYSTAL
   end
 
+  # Phase 3 increment 1: precise transitive reachability — the core of a precise
+  # GC mark phase, and a retainer/leak-analysis tool. Walks the object graph from
+  # a root using the RTTI reference layout and returns every reachable object.
+  it "reachable_from transitively visits the precise object graph" do
+    run(<<-CRYSTAL, flags: ["rtti"]).to_b.should be_true
+      require "prelude"
+
+      class RNode
+        property link : RNode?
+        property name : String
+
+        def initialize(@name, @link = nil)
+        end
+      end
+
+      a = RNode.new("alpha")
+      b = RNode.new("beta", a)
+      root = RNode.new("root", b)
+      unreached = RNode.new("unreached") # reachable from the stack, but not from `root`
+
+      set = Crystal::RTTI.reachable_from(root)
+
+      # The transitive closure from `root`: root -> b -> a, plus each node's
+      # String name; `unreached` is not reachable *from root* so it's excluded.
+      set.includes?(root.as(Void*).address) &&
+        set.includes?(b.as(Void*).address) &&
+        set.includes?(a.as(Void*).address) &&
+        set.includes?(root.name.as(Void*).address) &&
+        set.includes?(a.name.as(Void*).address) &&
+        !set.includes?(unreached.as(Void*).address)
+      CRYSTAL
+  end
+
+  it "reachable_from follows references through Array elements" do
+    run(<<-CRYSTAL, flags: ["rtti"]).to_b.should be_true
+      require "prelude"
+
+      class RItem
+        @id : Int64
+
+        def initialize(@id)
+        end
+      end
+
+      class RBag
+        @items : Array(RItem)
+
+        def initialize(@items)
+        end
+      end
+
+      x = RItem.new(1)
+      y = RItem.new(2)
+      bag = RBag.new([x, y])
+
+      set = Crystal::RTTI.reachable_from(bag)
+      # The Array elements x and y must be reached through the buffer scan.
+      set.includes?(x.as(Void*).address) && set.includes?(y.as(Void*).address)
+      CRYSTAL
+  end
+
   it "gives distinct generic instantiations their own descriptors" do
     run(<<-CRYSTAL, flags: ["rtti"]).to_b.should be_true
       require "prelude"

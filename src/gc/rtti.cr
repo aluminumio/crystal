@@ -141,13 +141,17 @@ module Crystal::RTTI
   # Yields each non-null managed heap pointer stored directly in *obj*, located
   # precisely from the type's reference-field offsets — the operation a precise
   # GC mark phase performs on an object. Offsets are flattened through embedded
-  # value structs, so each points at an actual pointer slot.
-  #
-  # NOTE: pointers held inside variable-length container buffers (e.g. `Array`'s
-  # backing buffer) are not yet enumerated; see the pending container spec.
+  # value structs, and Array elements are scanned through the backing buffer.
   def self.each_outgoing_reference(obj : Reference, &block : Void* ->) : Nil
-    desc = descriptor(obj)
-    base = obj.as(Void*).address
+    each_outgoing_reference_at(obj.as(Void*), obj.crystal_type_id, &block)
+  end
+
+  # Pointer-based core of `each_outgoing_reference`, usable when only a raw
+  # object pointer + its type id are in hand (e.g. during a transitive walk,
+  # where casting to the abstract `Reference` is not possible).
+  private def self.each_outgoing_reference_at(base_ptr : Void*, type_id : Int32, &block : Void* ->) : Nil
+    desc = descriptor(type_id)
+    base = base_ptr.address
 
     desc.reference_offsets.each do |offset|
       ptr = Pointer(Void*).new(base + offset).value
@@ -172,6 +176,41 @@ module Crystal::RTTI
         block.call(ptr) unless ptr.null?
       end
     end
+  end
+
+  # Returns the addresses of every Crystal object transitively reachable from
+  # *root* through its precise reference layout — i.e. a precise mark starting
+  # from a single root. This is the core operation of a precise GC's mark phase,
+  # and the basis for retainer/leak analysis ("what is reachable from X?").
+  #
+  # A yielded pointer is followed only when its header is a plausible type id, so
+  # raw buffers (e.g. an Array's backing storage, whose elements are already
+  # scanned) and non-object/interior pointers are treated as leaves.
+  def self.reachable_from(root : Reference) : Set(UInt64)
+    n = LibRTTI.count
+    visited = Set(UInt64).new
+    stack = [] of Void*
+
+    root_ptr = root.as(Void*)
+    visited << root_ptr.address
+    stack << root_ptr
+
+    until stack.empty?
+      ptr = stack.pop
+      # Header type id; valid because every pushed pointer was validated below
+      # (and the root is a real object).
+      type_id = ptr.as(Int32*).value
+      each_outgoing_reference_at(ptr, type_id) do |ref|
+        addr = ref.address
+        next if visited.includes?(addr)
+        ref_type_id = ref.as(Int32*).value
+        next unless 0 <= ref_type_id < n # only traverse into objects with a valid header
+        visited << addr
+        stack << ref
+      end
+    end
+
+    visited
   end
 
   # A per-type live-heap usage entry.
