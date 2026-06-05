@@ -145,13 +145,13 @@ module Crystal::RTTI
   #
   # NOTE: pointers held inside variable-length container buffers (e.g. `Array`'s
   # backing buffer) are not yet enumerated; see the pending container spec.
-  def self.each_outgoing_reference(obj : Reference, & : Void* ->) : Nil
+  def self.each_outgoing_reference(obj : Reference, &block : Void* ->) : Nil
     desc = descriptor(obj)
     base = obj.as(Void*).address
 
     desc.reference_offsets.each do |offset|
       ptr = Pointer(Void*).new(base + offset).value
-      yield ptr unless ptr.null?
+      block.call(ptr) unless ptr.null?
     end
 
     # Variable-length container (e.g. Array): scan the live elements of the
@@ -169,7 +169,7 @@ module Crystal::RTTI
       buffer_addr = buffer.address
       count.times do |i|
         ptr = Pointer(Void*).new(buffer_addr + i.to_u64 * stride).value
-        yield ptr unless ptr.null?
+        block.call(ptr) unless ptr.null?
       end
     end
   end
